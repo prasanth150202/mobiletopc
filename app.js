@@ -10,6 +10,10 @@ const emptyState = document.querySelector('#empty-state');
 const toast = document.querySelector('#toast');
 const sessionIndicator = document.querySelector('#session-indicator');
 const serviceStatus = document.querySelector('#service-status');
+const connectionDialog = document.querySelector('#connection-dialog');
+const connectionForm = document.querySelector('#connection-form');
+const serviceUrlInput = document.querySelector('#service-url-input');
+const serviceTokenInput = document.querySelector('#service-token-input');
 const deviceSizes = {
   desktop: { width: 1440, height: 900 },
   tablet: { width: 820, height: 1180 },
@@ -27,6 +31,28 @@ let currentViewport = deviceSizes.desktop;
 let frameTimes = [];
 let touchActive = false;
 let lastFrameData = '';
+const serviceStorageKey = 'phonetopc.serviceUrl';
+const tokenStorageKey = 'phonetopc.serviceToken';
+
+function getConfiguredServiceUrl() {
+  const queryUrl = new URLSearchParams(location.search).get('service');
+  return queryUrl || localStorage.getItem(serviceStorageKey) || `${location.protocol}//${location.host}`;
+}
+
+function toWebSocketUrl(value) {
+  const input = value.trim();
+  if (!input) throw new Error('Enter the public URL of your browser service.');
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(input)
+    ? input
+    : `${location.protocol === 'https:' ? 'https:' : 'http:'}//${input}`;
+  const url = new URL(candidate);
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) throw new Error('Use an HTTP(S) or WS(S) service URL.');
+  url.protocol = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:';
+  if (!url.pathname || url.pathname === '/') url.pathname = '/ws';
+  if (url.pathname.replace(/\/$/, '') !== '/ws') url.pathname = `${url.pathname.replace(/\/$/, '')}/ws`;
+  url.hash = '';
+  return url;
+}
 
 function setService(state) {
   serviceStatus.dataset.state = state;
@@ -66,15 +92,32 @@ function send(message) {
 
 function connect() {
   clearTimeout(socketTimer);
-  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  socket = new WebSocket(`${scheme}//${location.host}/ws`);
-  socket.addEventListener('open', () => {
-    setService('online');
-    if (pendingStart) beginSession();
+  let endpoint;
+  try {
+    endpoint = toWebSocketUrl(getConfiguredServiceUrl());
+  } catch (error) {
+    setService('offline');
+    showError(error.message);
+    return;
+  }
+  const connection = new WebSocket(endpoint);
+  socket = connection;
+  connection.addEventListener('open', () => {
+    if (socket !== connection) return;
+    connection.send(JSON.stringify({ type: 'auth', token: sessionStorage.getItem(tokenStorageKey) || '' }));
   });
-  socket.addEventListener('message', (event) => {
+  connection.addEventListener('message', (event) => {
+    if (socket !== connection) return;
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
+    if (message.type === 'authenticated') {
+      setService('online');
+      if (pendingStart) beginSession();
+    }
+    if (message.type === 'auth-error') {
+      setService('offline');
+      showError(message.message || 'The access token was rejected.');
+    }
     if (message.type === 'status') setSession(message.status);
     if (message.type === 'frame') showFrame(message);
     if (message.type === 'navigated') updatePage(message);
@@ -83,12 +126,13 @@ function connect() {
       showError(message.message || 'The remote browser could not complete that action.');
     }
   });
-  socket.addEventListener('close', () => {
+  connection.addEventListener('close', () => {
+    if (socket !== connection) return;
     setService('offline');
     setSession('idle');
     socketTimer = setTimeout(connect, 1800);
   });
-  socket.addEventListener('error', () => socket.close());
+  connection.addEventListener('error', () => connection.close());
 }
 
 function normalizeAddress(value) {
@@ -305,6 +349,39 @@ viewportStage.addEventListener('keyup', (event) => {
 
 window.addEventListener('beforeunload', () => {
   if (socket?.readyState === WebSocket.OPEN) socket.close();
+});
+
+document.querySelector('#connection-settings-button').addEventListener('click', () => {
+  serviceUrlInput.value = getConfiguredServiceUrl();
+  serviceTokenInput.value = sessionStorage.getItem(tokenStorageKey) || '';
+  connectionDialog.showModal();
+});
+
+document.querySelector('#connection-cancel').addEventListener('click', () => connectionDialog.close());
+
+document.querySelector('#connection-reset').addEventListener('click', () => {
+  localStorage.removeItem(serviceStorageKey);
+  sessionStorage.removeItem(tokenStorageKey);
+  serviceUrlInput.value = `${location.protocol}//${location.host}`;
+  serviceTokenInput.value = '';
+  connectionDialog.close();
+  socket?.close();
+  connect();
+});
+
+connectionForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  try {
+    const endpoint = toWebSocketUrl(serviceUrlInput.value);
+    const savedOrigin = `${endpoint.protocol === 'wss:' ? 'https:' : 'http:'}//${endpoint.host}`;
+    localStorage.setItem(serviceStorageKey, savedOrigin);
+    if (serviceTokenInput.value) sessionStorage.setItem(tokenStorageKey, serviceTokenInput.value);
+    else sessionStorage.removeItem(tokenStorageKey);
+    connectionDialog.close();
+    pendingStart = false;
+    socket?.close();
+    connect();
+  } catch (error) { showError(error.message); }
 });
 
 updateDetection();

@@ -7,6 +7,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const port = Number(process.env.PORT || 8787);
+const accessToken = process.env.REMOTE_ACCESS_TOKEN || '';
 const viewports = {
   desktop: { width: 1440, height: 900 },
   tablet: { width: 820, height: 1180 },
@@ -37,6 +38,7 @@ const server = createServer((request, response) => {
 });
 
 const sockets = new WebSocketServer({ server, path: '/ws' });
+const authorizedSockets = new Set();
 let browser;
 let context;
 let page;
@@ -50,7 +52,7 @@ function send(socket, message) {
 }
 
 function broadcast(message) {
-  for (const socket of sockets.clients) send(socket, message);
+  for (const socket of authorizedSockets) send(socket, message);
 }
 
 function normalizeUrl(value) {
@@ -176,16 +178,36 @@ async function handleMessage(socket, message) {
 }
 
 sockets.on('connection', (socket) => {
-  send(socket, { type: 'status', status: page ? 'connected' : 'idle' });
+  let authorized = !accessToken;
+  if (authorized) {
+    authorizedSockets.add(socket);
+    send(socket, { type: 'authenticated' });
+    send(socket, { type: 'status', status: page ? 'connected' : 'idle' });
+  }
+  socket.on('close', () => authorizedSockets.delete(socket));
   socket.on('message', (raw) => {
     try {
-      void handleMessage(socket, JSON.parse(raw.toString()));
+      const message = JSON.parse(raw.toString());
+      if (!authorized) {
+        if (message.type !== 'auth' || message.token !== accessToken) {
+          send(socket, { type: 'auth-error', message: 'Invalid remote service access token.' });
+          socket.close(1008, 'Unauthorized');
+          return;
+        }
+        authorized = true;
+        authorizedSockets.add(socket);
+        send(socket, { type: 'authenticated' });
+        send(socket, { type: 'status', status: page ? 'connected' : 'idle' });
+        return;
+      }
+      if (message.type === 'auth') return;
+      void handleMessage(socket, message);
     } catch {
       send(socket, { type: 'error', message: 'Invalid WebSocket message.' });
     }
   });
 });
 
-server.listen(port, '127.0.0.1', () => {
+server.listen(port, '0.0.0.0', () => {
   console.log(`Phonetopc running at http://localhost:${port}`);
 });
